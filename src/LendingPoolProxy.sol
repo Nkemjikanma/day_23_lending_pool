@@ -92,8 +92,7 @@ contract LendingPoolProxy {
     mapping(address => Loan[]) public userLoans;
 
     // mapping to tract liquidation history
-    mapping(address => mapping(uint256 => LiquidationEvent))
-        public liqudationHistory;
+    mapping(address => mapping(uint256 => LiquidationEvent)) public liqudationHistory;
 
     // mapping to track interest ratte model per asset
     mapping(address => InterestCalculator) public interestModels;
@@ -133,8 +132,7 @@ contract LendingPoolProxy {
     }
 
     address constant BTCUSD = 0x0FB99723Aee6f420beAD13e6bBB79b7E6F034298;
-    address constant ethUsdPriceFeed =
-        0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1;
+    address constant ethUsdPriceFeed = 0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1;
     address constant USDCUSD = 0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165;
 
     constructor() {
@@ -206,37 +204,23 @@ contract LendingPoolProxy {
         lastInterestAccuralTimestamp[usdc] = block.timestamp;
     }
 
-    function calculatePositionHealth(
-        address user
-    ) public view returns (PositionHealth memory) {
+    function calculatePositionHealth(address user) public view returns (PositionHealth memory) {
         PositionHealth memory health;
 
         uint256 collateralValueUSD = 0;
 
-        for (
-            uint256 i = 0;
-            i < userAccounts[user].collateralAssets.length;
-            i++
-        ) {
+        for (uint256 i = 0; i < userAccounts[user].collateralAssets.length; i++) {
             address asset = userAccounts[user].collateralAssets[i];
             uint256 amount = userCollateral[user][asset];
-            uint256 valueUSD = getAssetPrice(
-                amount,
-                AggregatorV3Interface(asset)
-            );
+            uint256 valueUSD = getAssetPrice(amount, AggregatorV3Interface(asset));
 
             // apply collateral factor
-            valueUSD =
-                (valueUSD * assetConfigs[assert].collateralFactor) /
-                1000;
+            valueUSD = (valueUSD * assetConfigs[assert].collateralFactor) / 1000;
         }
     }
 
-    function getAssetPrice(
-        uint256 amount,
-        AggregatorV3Interface asset
-    ) public view returns (uint256) {
-        (, int256 price, , uint256 updatedAt, ) = asset.latestRoundData();
+    function getAssetPrice(uint256 amount, AggregatorV3Interface asset) public view returns (uint256) {
+        (, int256 price,, uint256 updatedAt,) = asset.latestRoundData();
 
         if (price <= 0) {
             revert LendingPool__ErrorInPrice();
@@ -246,8 +230,7 @@ contract LendingPoolProxy {
             revert LendingPool__StalePriceData();
         }
 
-        uint256 assetInUSD = (amount * uint256(price)) /
-            (10 ** asset.decimals());
+        uint256 assetInUSD = (amount * uint256(price)) / (10 ** asset.decimals());
 
         return assetInUSD;
     }
