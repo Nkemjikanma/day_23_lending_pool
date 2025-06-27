@@ -13,6 +13,10 @@ contract LendingPoolProxy {
     error LendingPool_BelowMinimumRatio();
     error LendingPool__StalePriceData();
     error LendingPool__ErrorInPrice();
+    error LendingPool__InvalidDepositAmount();
+    error LendingPool__AssetNotAccepted();
+    error LendingPool__NotEnoughLiquidity();
+    error LendingPool__NoBorrowsForAsset();
 
     address public owner;
 
@@ -92,7 +96,8 @@ contract LendingPoolProxy {
     mapping(address => Loan[]) public userLoans;
 
     // mapping to tract liquidation history
-    mapping(address => mapping(uint256 => LiquidationEvent)) public liqudationHistory;
+    mapping(address => mapping(uint256 => LiquidationEvent))
+        public liqudationHistory;
 
     // mapping to track interest ratte model per asset
     mapping(address => InterestCalculator) public interestModels;
@@ -131,9 +136,23 @@ contract LendingPoolProxy {
         _;
     }
 
-    address constant BTCUSD = 0x0FB99723Aee6f420beAD13e6bBB79b7E6F034298;
-    address constant ethUsdPriceFeed = 0x4aDC67696bA383F43DD60A9e78F2C97Fbbfc7cb1;
-    address constant USDCUSD = 0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165;
+    event CollateralDeposited(
+        address indexed _sender,
+        address indexed _token,
+        uint256 _value
+    );
+    event Borrowed(
+        address indexed _sender,
+        address indexed _token,
+        uint256 _value
+    );
+
+    event LoanRepaid(
+        address indexed _sender,
+        address indexed _token,
+        uint256 _effectivePayment,
+        int256 _interestPayment
+    );
 
     constructor() {
         owner = msg.sender;
@@ -204,23 +223,321 @@ contract LendingPoolProxy {
         lastInterestAccuralTimestamp[usdc] = block.timestamp;
     }
 
-    function calculatePositionHealth(address user) public view returns (PositionHealth memory) {
+    function depositCollateral(address token, uint256 amount) external payable {
+        if (msg.value <= 0 || amount <= 0) {
+            revert LendingPool__InvalidDepositAmount();
+        }
+
+        if (!supportedAssets[token]) {
+            revert LendingPool__AssetNotAccepted();
+        }
+
+        bool tokenExist = false;
+        for (
+            uint256 i = 0;
+            i < userAccount[msg.sender].collateralAssets.length;
+            i++
+        ) {
+            if (token == userAccount[msg.sender].collateralAssets[i]) {
+                tokenExist = true;
+                break;
+            }
+        }
+
+        if (!tokenExist) {
+            userAccount[msg.sender].collateralAssets.push(token);
+        }
+
+        userCollateral[msg.sender][token] += amount;
+        totalDeposits[msg.sender] += amount;
+
+        emit CollateralDeposited(msg.sender, msg.value);
+    }
+
+    function borrow(
+        address token,
+        uint256 amount
+    ) external sufficientCollateral(msg.sender) {
+        if (msg.value <= 0 || amount <= 0) {
+            revert LendingPool__InvalidDepositAmount();
+        }
+
+        if (!supportedAssets[token]) {
+            revert LendingPool__AssetNotAccepted();
+        }
+
+        if (totalDeposits[token] - totalBorrows < amount) {
+            revert LendingPool__NotEnoughLiquidity();
+        }
+
+        bool tokenExists = false;
+        for (
+            uint i = 0;
+            i < userAccounts[msg.sender].borrowedAssets.length;
+            i++
+        ) {
+            if (userAccounts[msg.sender].borrowedAssets[i] == token) {
+                tokenExists = true;
+                break;
+            }
+        }
+
+        if (!tokenExists) {
+            userAccounts[msg.sender].borrowedAssets.push(token);
+        }
+
+        userBorrows[msg.sender][token] += amount;
+        borrowTimestamp[msg.sender][token] = block.timestamp;
+        totalBorrows[token] += amount;
+        userAccounts[msg.sender].totalBorrowsUSD += getAssetPrice(
+            amount,
+            AggregatorV3Interface(token)
+        );
+
+        Loan memory userLoan = Loan({
+            borrowAsset: token,
+            borrowAmount: amount,
+            startTimestamp: block.timestamp,
+            interestRate: assetConfigs[token].borrowInterestRate,
+            active: true,
+            amountRepaid: 0
+        });
+
+        userLoans[msg.sender].push(newLoan);
+
+        // Transfer tokens to user
+        if (token == address(0)) {
+            // For ETH - confirm if this works same for L2 eth
+            payable(msg.sender).transfer(amount);
+        } else {
+            // For ERC20 tokens
+            IERC20(token).transfer(msg.sender, amount);
+        }
+
+        emit Borrowed(msg.sender, token, amount);
+    }
+
+    function repay(address token, uint256 amount) external payable {
+        if (msg.value <= 0 || amount <= 0) {
+            revert LendingPool__InvalidDepositAmount();
+        }
+
+        if (!supportedAssets[token]) {
+            revert LendingPool__AssetNotAccepted();
+        }
+
+        // if user has any borrows for this token
+        if (userBorrows[msg.sender][token] == 0) {
+            revert LendingPool__NoBorrowsForAsset();
+        }
+
+        uint256 interest = calculateAccuredInterest(msg.sender, token, amount);
+        uint256 totalDebt = userBorrows[msg.sender][token] + interest;
+
+        uint256 effectiveRepayment = amount > totalDebt ? totalDebt : amount;
+        uint256 principalpayment = effectiveRepayment > interest
+            ? effectiveRepayment - interest
+            : 0;
+        uint256 interestRepayment = effectiveRepayment > interest
+            ? interest
+            : effectiveRepayment;
+
+        totalBorrows[token] -= principalpayment;
+        userBorrows[msg.sender][token] -= principalRepayment;
+
+        uint256 remainingRepayment = principalRepayment;
+        for (
+            uint i = 0;
+            i < userLoans[msg.sender].length && remainingRepayment > 0;
+            i++
+        ) {
+            Loan storage loan = userLoans[msg.sender][i];
+
+            if (loan.active && loan.borrowAsset == token) {
+                uint256 loanRemainingDebt = loan.borrowAmount -
+                    loan.amountRepaid;
+
+                if (loanRemainingDebt > 0) {
+                    // Calculate how much to apply to this loan
+                    uint256 loanRepayment = remainingRepayment >
+                        loanRemainingDebt
+                        ? loanRemainingDebt
+                        : remainingRepayment;
+
+                    // Update loan record
+                    loan.amountRepaid += loanRepayment;
+                    remainingRepayment -= loanRepayment;
+
+                    // Check if loan is fully repaid
+                    if (loan.amountRepaid >= loan.borrowAmount) {
+                        loan.active = false;
+                    }
+                }
+            }
+        }
+
+        if (userBorrows[msg.sender][token] == 0) {
+            _removeAssetFromBorrowedAssets(msg.sender, token);
+        }
+
+        emit LoanRepaid(
+            msg.sender,
+            token,
+            effectiveRepayment,
+            interestRepayment
+        );
+    }
+
+    function calculatePositionHealth(
+        address user
+    ) public view returns (PositionHealth memory) {
         PositionHealth memory health;
 
+        // calculate collateral value
         uint256 collateralValueUSD = 0;
-
-        for (uint256 i = 0; i < userAccounts[user].collateralAssets.length; i++) {
+        for (
+            uint256 i = 0;
+            i < userAccounts[user].collateralAssets.length;
+            i++
+        ) {
             address asset = userAccounts[user].collateralAssets[i];
             uint256 amount = userCollateral[user][asset];
-            uint256 valueUSD = getAssetPrice(amount, AggregatorV3Interface(asset));
+            uint256 valueUSD = getAssetPrice(
+                amount,
+                AggregatorV3Interface(asset)
+            );
 
             // apply collateral factor
-            valueUSD = (valueUSD * assetConfigs[assert].collateralFactor) / 1000;
+            valueUSD =
+                (valueUSD * assetConfigs[assert].collateralFactor) /
+                1000;
+
+            collateralValueUSD += valueUSD;
+        }
+
+        // calculate borrow value
+        uin256 borrowValueUSD = 0;
+        for (uint256 i = 0; i < userAccount[user].borrowedAssets.length; i++) {
+            address asset = userAccount[user].borrowAssets[i];
+            uint256 amount = userBorrows[user][asset];
+
+            // get interest
+            uint256 interest = calculateAccuredIntest(user, asset, amount);
+
+            uint256 totalOwed = interest + amount;
+            uint256 valueUSD = getAssetPrice(
+                amount,
+                AggregatorV3Interface(asset)
+            );
+            borrowValueUSD += valueUSD;
+        }
+
+        health.collaterlValueUSD = collateralValueUSD;
+        health.borrowValueUSD = borrowVAlueUSD;
+
+        if (borrowValueUSD == 0) {
+            health.healthFactor = type(uint256).max; // max value
+            health.isHealthy = true;
+        } else {
+            health.healthFactor = (collateralValueUSD * 100) / borrowValueUSD;
+            health.isHealthy = health.healthFactor >= liquidationTreshold;
+        }
+
+        return health;
+    }
+
+    function calculateAccuredInterest(
+        address user,
+        address asset,
+        uint256 amount
+    ) public view returns (uint256) {
+        InterestCalculator memory assetInterest = interestModels[asset];
+        uint256 borrowedAmount = userBorrows[user][asset];
+
+        // If no borrows, return 0
+        if (borrowedAmount == 0) {
+            return 0;
+        }
+
+        uint256 loanTime = borrowTimestamp[user][asset];
+
+        uint256 timeElapsed = block.timestamp - loanTime;
+
+        // If no time has passed, return 0
+        if (elapsedTime == 0) {
+            return 0;
+        }
+
+        InterestCalculator memory interestModel = interestModels[asset];
+
+        // Calculate current utilization rate to determine the dynamic interest rate
+        uint256 utilizationRate = calculateUtilizationRate(asset);
+
+        // Calculate the applicable interest rate based on utilization
+        uint256 interestRate = calculateApplicableInterestRate(
+            utilizationRate,
+            interestModel
+        );
+
+        // Convert annual interest rate to per-second rate
+        // Division by 10000 to convert from basis points to decimal
+        // Division by 31536000 (seconds in a year)
+        uint256 ratePerSecond = (interestRate * 1e14) / 31536000; // 1e14 = 10000 * 1e10 for precision
+
+        // Calculate compound interest: principal * ((1 + ratePerSecond) ^ elapsedTime) - principal
+        // For Solidity, we use the approximation: principal * (1 + ratePerSecond * elapsedTime)
+        uint256 interest = (borrowedAmount * ratePerSecond * elapsedTime) /
+            1e10;
+
+        return interest;
+    }
+
+    function calculateUtilizationRate(
+        address asset
+    ) internal view returns (uint256) {
+        uint256 totalDepositForAsset = totalDepoits[asset];
+
+        if (totalDepositForAsset == 0) {
+            return 0;
+        }
+
+        uint256 totalBorrowsForAsset = totalBorrows[asset];
+
+        // utilizaiton rate in basis points; (totalBorrows * 10000) / totalDeposits
+
+        return (totalBorrowsForAsset * 10000) / totalDepositsForAsset;
+    }
+
+    function calculateApplicabeInterestRate(
+        uint256 utilizationRate,
+        InterestCalculator memory model
+    ) internal pure returns (uin256) {
+        if (utilizationRate <= model.optimalUtilizationRate) {
+            // Calculate: baseRate + (utilizationRate * slope1) / optimalUtilizationRate
+            return
+                model.baseRatePerYear +
+                ((utilizationRate * model.slopeRate1) /
+                    model.optimalUtilizationRate);
+        }
+        // If utilization is above the optimal rate, use the second (steeper) slope
+        else {
+            // Calculate: baseRate + slope1 + ((utilizationRate - optimalRate) * slope2) / (10000 - optimalRate)
+            uint256 excessUtilization = utilizationRate -
+                model.optimalUtilizationRate;
+            uint256 remainingUtilization = 10000 - model.optimalUtilizationRate;
+
+            return
+                model.baseRatePerYear +
+                model.slopeRate1 +
+                ((excessUtilization * model.slopeRate2) / remainingUtilization);
         }
     }
 
-    function getAssetPrice(uint256 amount, AggregatorV3Interface asset) public view returns (uint256) {
-        (, int256 price,, uint256 updatedAt,) = asset.latestRoundData();
+    function getAssetPrice(
+        uint256 amount,
+        AggregatorV3Interface asset
+    ) public view returns (uint256) {
+        (, int256 price, , uint256 updatedAt, ) = asset.latestRoundData();
 
         if (price <= 0) {
             revert LendingPool__ErrorInPrice();
@@ -230,8 +547,28 @@ contract LendingPoolProxy {
             revert LendingPool__StalePriceData();
         }
 
-        uint256 assetInUSD = (amount * uint256(price)) / (10 ** asset.decimals());
+        uint256 assetInUSD = (amount * uint256(price)) /
+            (10 ** asset.decimals());
 
         return assetInUSD;
+    }
+
+    function _removeAssetFromBorrowedAssets(
+        address user,
+        address token
+    ) internal {
+        UserAccount storage account = userAccounts[user];
+        for (uint i = 0; i < account.borrowedAssets.length; i++) {
+            if (account.borrowedAssets[i] == token) {
+                // Replace with the last element and pop
+                if (i < account.borrowedAssets.length - 1) {
+                    account.borrowedAssets[i] = account.borrowedAssets[
+                        account.borrowedAssets.length - 1
+                    ];
+                }
+                account.borrowedAssets.pop();
+                break;
+            }
+        }
     }
 }
